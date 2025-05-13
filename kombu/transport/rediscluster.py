@@ -214,7 +214,7 @@ class QoS(RedisQoS):
     We can use hash tag to do that.
     Then we can take the node holding the slot as a single Redis instance, and run transaction on that node.
 
-    Because node.redis_connection(redis.client.Redis) is not override-able, global_prefix cannot
+    Because node.valkey_connection(redis.client.Redis) is not override-able, global_prefix cannot
     take effect in transaction. So we need to add prefix manually.
     """
 
@@ -229,7 +229,7 @@ class QoS(RedisQoS):
                     client.keyslot(self.unacked_mutex_key)
                 )
                 with Mutex(
-                    node.redis_connection,
+                    node.valkey_connection,
                     self.unacked_mutex_key,
                     self.unacked_mutex_expire,
                 ):
@@ -264,7 +264,7 @@ class QoS(RedisQoS):
                 node = client.nodes_manager.get_node_from_slot(
                     client.keyslot(self.unacked_key)
                 )
-                node.redis_connection.transaction(
+                node.valkey_connection.transaction(
                     restore_transaction,
                     self.channel.global_keyprefix + self.unacked_key,
                 )
@@ -338,7 +338,7 @@ class MultiChannelPoller(RedisMultiChannelPoller):
                     slot, read_from_replicas=False
                 )
                 # Different queues use different connections
-                conn = node.redis_connection.connection_pool.get_connection("_")
+                conn = node.valkey_connection.connection_pool.get_connection("_")
                 self._chan_active_queues_to_conn[(channel, queue)] = conn
             conns.add(self._chan_active_queues_to_conn[(channel, queue)])
         return conns
@@ -375,20 +375,20 @@ class MultiChannelPoller(RedisMultiChannelPoller):
                 self._unregister_connection(conn, fileno=fileno)
                 raise Empty()
 
-    def _unregister_connection(self, redis_connection, fileno=None):
-        if not fileno and redis_connection._sock:
-            fileno = redis_connection._sock.fileno()
+    def _unregister_connection(self, valkey_connection, fileno=None):
+        if not fileno and valkey_connection._sock:
+            fileno = valkey_connection._sock.fileno()
 
         self._fd_to_chan.pop(fileno, None)
         for channel, client, conn, type in list(self._chan_to_sock.keys()):
-            if conn == redis_connection:
+            if conn == valkey_connection:
                 del self._chan_to_sock[(channel, client, conn, type)]
 
         for channel, queue in list(self._chan_active_queues_to_conn.keys()):
-            if self._chan_active_queues_to_conn[(channel, queue)] == redis_connection:
+            if self._chan_active_queues_to_conn[(channel, queue)] == valkey_connection:
                 del self._chan_active_queues_to_conn[(channel, queue)]
         try:
-            self.poller.unregister(redis_connection._sock)
+            self.poller.unregister(valkey_connection._sock)
         except (KeyError, ValueError):
             pass
 
@@ -489,7 +489,7 @@ class Channel(RedisChannel):
                 node = client.nodes_manager.get_node_from_slot(
                     client.keyslot(self.unacked_key)
                 )
-                node.redis_connection.transaction(
+                node.valkey_connection.transaction(
                     restore_transaction, self.global_keyprefix + self.unacked_key
                 )
             else:
@@ -549,7 +549,7 @@ class Channel(RedisChannel):
                     f"{conn.host}:{conn.port}", None
                 )
                 # Reset the cluster node's connection
-                target_node.redis_connection = None
+                target_node.valkey_connection = None
                 self.client.nodes_manager.initialize()
                 raise
             except (MovedError, valkey.exceptions.MovedError):

@@ -52,8 +52,10 @@ from contextlib import contextmanager
 from queue import Empty
 from time import time
 
-from redis.exceptions import (AskError, MovedError, RedisClusterException,
-                              TryAgainError)
+import valkey
+import valkey.cluster
+import valkey.exceptions
+from redis.exceptions import AskError, MovedError, RedisClusterException, TryAgainError
 
 from kombu.exceptions import VersionMismatch
 from kombu.log import get_logger
@@ -70,10 +72,9 @@ from ..utils.scheduling import cycle_by_name
 from .redis import Channel as RedisChannel
 from .redis import GlobalKeyPrefixMixin as RedisGlobalKeyPrefixMixin
 from .redis import MultiChannelPoller as RedisMultiChannelPoller
-from .redis import MutexHeld
+from .redis import MutexHeld, _after_fork_cleanup_channel
 from .redis import QoS as RedisQoS
 from .redis import Transport as RedisTransport
-from .redis import _after_fork_cleanup_channel
 
 try:
     import redis
@@ -90,7 +91,7 @@ def Mutex(client, name, expire):
 
     The internal implementation of lock uses uuid as the key, so it cannot be used in cluster mode. Use setnx instead
     """
-    lock_id = uuid().encode('utf-8')
+    lock_id = uuid().encode("utf-8")
     acquired = client.set(name, lock_id, ex=expire, nx=True)
     try:
         if acquired:
@@ -108,7 +109,7 @@ def Mutex(client, name, expire):
                         pipe.execute()
                         return
                     pipe.unwatch()
-                except redis.exceptions.WatchError:
+                except (redis.exceptions.WatchError, valkey.exceptions.WatchError):
                     pass
 
 
@@ -138,12 +139,12 @@ class GlobalKeyPrefixMixin(RedisGlobalKeyPrefixMixin):
         )
 
 
-class PrefixedStrictRedis(GlobalKeyPrefixMixin, redis.RedisCluster):
+class PrefixedStrictRedis(GlobalKeyPrefixMixin, valkey.RedisCluster):
     """Returns a ``RedisCluster`` client that prefixes the keys it uses."""
 
     def __init__(self, *args, **kwargs):
-        self.global_keyprefix = kwargs.pop('global_keyprefix', '')
-        redis.RedisCluster.__init__(self, *args, **kwargs)
+        self.global_keyprefix = kwargs.pop("global_keyprefix", "")
+        valkey.RedisCluster.__init__(self, *args, **kwargs)
 
     def pubsub(self, **kwargs):
         return PrefixedRedisPubSub(
@@ -153,18 +154,18 @@ class PrefixedStrictRedis(GlobalKeyPrefixMixin, redis.RedisCluster):
         )
 
     def keyslot(self, key):
-        return super().keyslot(f'{self.global_keyprefix}{key}')
+        return super().keyslot(f"{self.global_keyprefix}{key}")
 
 
-class PrefixedRedisPipeline(GlobalKeyPrefixMixin, redis.cluster.ClusterPipeline):
+class PrefixedRedisPipeline(GlobalKeyPrefixMixin, valkey.cluster.ClusterPipeline):
     """Custom Redis cluster pipeline that takes global_keyprefix into consideration."""
 
     def __init__(self, *args, **kwargs):
-        self.global_keyprefix = kwargs.pop('global_keyprefix', '')
-        redis.cluster.ClusterPipeline.__init__(self, *args, **kwargs)
+        self.global_keyprefix = kwargs.pop("global_keyprefix", "")
+        valkey.cluster.ClusterPipeline.__init__(self, *args, **kwargs)
 
 
-class PrefixedRedisPubSub(redis.cluster.ClusterPubSub):
+class PrefixedRedisPubSub(valkey.cluster.ClusterPubSub):
     """Redis cluster pubsub client that takes global_keyprefix into consideration."""
 
     PUBSUB_COMMANDS = (
@@ -175,7 +176,7 @@ class PrefixedRedisPubSub(redis.cluster.ClusterPubSub):
     )
 
     def __init__(self, *args, **kwargs):
-        self.global_keyprefix = kwargs.pop('global_keyprefix', '')
+        self.global_keyprefix = kwargs.pop("global_keyprefix", "")
         super().__init__(*args, **kwargs)
 
     def _prefix_args(self, args):
@@ -183,10 +184,7 @@ class PrefixedRedisPubSub(redis.cluster.ClusterPubSub):
         command = args.pop(0)
 
         if command in self.PUBSUB_COMMANDS:
-            args = [
-                self.global_keyprefix + str(arg)
-                for arg in args
-            ]
+            args = [self.global_keyprefix + str(arg) for arg in args]
 
         return [command, *args]
 
@@ -200,7 +198,7 @@ class PrefixedRedisPubSub(redis.cluster.ClusterPubSub):
         message_type, *channels, message = ret
         return [
             message_type,
-            *[channel[len(self.global_keyprefix):] for channel in channels],
+            *[channel[len(self.global_keyprefix) :] for channel in channels],
             message,
         ]
 
@@ -227,32 +225,49 @@ class QoS(RedisQoS):
         with self.channel.conn_or_acquire() as client:
             ceil = time() - self.visibility_timeout
             try:
-                node = client.nodes_manager.get_node_from_slot(client.keyslot(self.unacked_mutex_key))
-                with Mutex(node.redis_connection, self.unacked_mutex_key,
-                           self.unacked_mutex_expire):
+                node = client.nodes_manager.get_node_from_slot(
+                    client.keyslot(self.unacked_mutex_key)
+                )
+                with Mutex(
+                    node.redis_connection,
+                    self.unacked_mutex_key,
+                    self.unacked_mutex_expire,
+                ):
                     visible = client.zrevrangebyscore(
-                        self.unacked_index_key, ceil, 0,
-                        start=num and start, num=num, withscores=True)
+                        self.unacked_index_key,
+                        ceil,
+                        0,
+                        start=num and start,
+                        num=num,
+                        withscores=True,
+                    )
                     for tag, score in visible or []:
                         self.restore_by_tag(tag, client)
             except MutexHeld:
                 pass
 
     def restore_by_tag(self, tag, client=None, leftmost=False):
-
         def restore_transaction(pipe):
             p = pipe.hget(self.channel.global_keyprefix + self.unacked_key, tag)
             pipe.multi()
-            self._remove_from_indices(tag, pipe, key_prefix=self.channel.global_keyprefix)
+            self._remove_from_indices(
+                tag, pipe, key_prefix=self.channel.global_keyprefix
+            )
             if p:
                 M, EX, RK = loads(bytes_to_str(p))
-                self.channel._do_restore_message(M, EX, RK, pipe, leftmost, key_prefix=self.channel.global_keyprefix)
+                self.channel._do_restore_message(
+                    M, EX, RK, pipe, leftmost, key_prefix=self.channel.global_keyprefix
+                )
 
         with self.channel.conn_or_acquire(client) as client:
             if self.channel.hash_tag:
-                node = client.nodes_manager.get_node_from_slot(client.keyslot(self.unacked_key))
-                node.redis_connection.transaction(restore_transaction,
-                                                  self.channel.global_keyprefix + self.unacked_key)
+                node = client.nodes_manager.get_node_from_slot(
+                    client.keyslot(self.unacked_key)
+                )
+                node.redis_connection.transaction(
+                    restore_transaction,
+                    self.channel.global_keyprefix + self.unacked_key,
+                )
             else:
                 # Without transactions, problems may occur
                 p = client.hget(self.unacked_key, tag)
@@ -263,10 +278,11 @@ class QoS(RedisQoS):
                         self.channel._do_restore_message(M, EX, RK, pipe, leftmost)
                     pipe.execute()
 
-    def _remove_from_indices(self, delivery_tag, pipe=None, key_prefix=''):
+    def _remove_from_indices(self, delivery_tag, pipe=None, key_prefix=""):
         with self.pipe_or_acquire(pipe) as pipe:
-            return pipe.zrem(key_prefix + self.unacked_index_key, delivery_tag) \
-                .hdel(key_prefix + self.unacked_key, delivery_tag)
+            return pipe.zrem(key_prefix + self.unacked_index_key, delivery_tag).hdel(
+                key_prefix + self.unacked_key, delivery_tag
+            )
 
 
 class MultiChannelPoller(RedisMultiChannelPoller):
@@ -318,7 +334,9 @@ class MultiChannelPoller(RedisMultiChannelPoller):
         for queue in channel.active_queues:
             if (channel, queue) not in self._chan_active_queues_to_conn:
                 slot = channel.client.keyslot(queue)
-                node = channel.client.nodes_manager.get_node_from_slot(slot, read_from_replicas=False)
+                node = channel.client.nodes_manager.get_node_from_slot(
+                    slot, read_from_replicas=False
+                )
                 # Different queues use different connections
                 conn = node.redis_connection.connection_pool.get_connection("_")
                 self._chan_active_queues_to_conn[(channel, queue)] = conn
@@ -329,7 +347,7 @@ class MultiChannelPoller(RedisMultiChannelPoller):
         conns = self._get_conns_for_channel(channel)
 
         for conn in conns:
-            ident = (channel, channel.client, conn, 'BRPOP')
+            ident = (channel, channel.client, conn, "BRPOP")
             if conn._sock is None or ident not in self._chan_to_sock:
                 channel._in_poll = False
                 self._register(*ident)
@@ -338,7 +356,7 @@ class MultiChannelPoller(RedisMultiChannelPoller):
 
     def _register_LISTEN(self, channel):
         conn = channel.subclient.connection
-        ident = (channel, channel.subclient, conn, 'LISTEN')
+        ident = (channel, channel.subclient, conn, "LISTEN")
         if conn._sock is None or ident not in self._chan_to_sock:
             channel._in_listen = False
             self._register(*ident)
@@ -349,8 +367,8 @@ class MultiChannelPoller(RedisMultiChannelPoller):
         chan, conn, type = self._fd_to_chan[fileno]
         if chan.qos.can_consume():
             try:
-                chan.handlers[type](**{'conn': conn})
-            except MovedError:
+                chan.handlers[type](**{"conn": conn})
+            except (MovedError, valkey.exceptions.MovedError):
                 # When a key is moved, the connection previously used to access the key
                 # needs to be replaced with the new connection after the move.
                 # The connection will be rebuilt in the next loop.
@@ -392,16 +410,13 @@ class Channel(RedisChannel):
     _in_poll_connections = set()
     _in_listen = False
 
-    hash_tag = ''
-    unacked_key = 'unacked'
-    unacked_index_key = 'unacked_index'
-    unacked_mutex_key = 'unacked_mutex'
-    global_keyprefix = ''
+    hash_tag = ""
+    unacked_key = "unacked"
+    unacked_index_key = "unacked_index"
+    unacked_mutex_key = "unacked_mutex"
+    global_keyprefix = ""
 
-    from_transport_options = (
-            RedisChannel.from_transport_options +
-            ('hash_tag',)
-    )
+    from_transport_options = RedisChannel.from_transport_options + ("hash_tag",)
 
     def __init__(self, connection, *args, **kwargs):
         VirtualBaseChannel.__init__(self, connection, *args, **kwargs)
@@ -413,13 +428,13 @@ class Channel(RedisChannel):
         self.active_fanout_queues = set()
         self.auto_delete_queues = set()
         self._fanout_to_queue = {}
-        self.handlers = {'BRPOP': self._brpop_read, 'LISTEN': self._receive}
+        self.handlers = {"BRPOP": self._brpop_read, "LISTEN": self._receive}
 
         if self.fanout_prefix:
             if isinstance(self.fanout_prefix, str):
                 self.keyprefix_fanout = self.fanout_prefix
         else:
-            self.keyprefix_fanout = ''
+            self.keyprefix_fanout = ""
 
         self.connection.cycle.add(self)
         self._registered = True
@@ -431,7 +446,7 @@ class Channel(RedisChannel):
         if not self.hash_tag:
             self.priority_steps = [0]
         else:
-            self.global_keyprefix = f'{self.hash_tag}{self.global_keyprefix}'
+            self.global_keyprefix = f"{self.hash_tag}{self.global_keyprefix}"
 
         self.Client = self._get_client()
 
@@ -465,12 +480,18 @@ class Channel(RedisChannel):
             pipe.hdel(self.global_keyprefix + self.unacked_key, tag)
             if P:
                 M, EX, RK = loads(bytes_to_str(P))
-                self._do_restore_message(M, EX, RK, pipe, leftmost, key_prefix=self.global_keyprefix)
+                self._do_restore_message(
+                    M, EX, RK, pipe, leftmost, key_prefix=self.global_keyprefix
+                )
 
         with self.conn_or_acquire() as client:
             if self.hash_tag:
-                node = client.nodes_manager.get_node_from_slot(client.keyslot(self.unacked_key))
-                node.redis_connection.transaction(restore_transaction, self.global_keyprefix + self.unacked_key)
+                node = client.nodes_manager.get_node_from_slot(
+                    client.keyslot(self.unacked_key)
+                )
+                node.redis_connection.transaction(
+                    restore_transaction, self.global_keyprefix + self.unacked_key
+                )
             else:
                 # Without transactions, problems may occur
                 P = client.hget(self.unacked_key, tag)
@@ -485,50 +506,62 @@ class Channel(RedisChannel):
         queues = self._queue_cycle.consume(len(self.active_queues))
         if not queues:
             return
-        pri_queues = [self._q_for_pri(queue, pri) for pri in self.priority_steps
-                      for queue in queues]
+        pri_queues = [
+            self._q_for_pri(queue, pri)
+            for pri in self.priority_steps
+            for queue in queues
+        ]
         self._in_poll = True
 
         node_to_keys = {}
         for key in pri_queues:
-            node = self.client.nodes_manager.get_node_from_slot(self.client.keyslot(key))
-            node_to_keys.setdefault(f'{node.host}:{node.port}', []).append(key)
+            node = self.client.nodes_manager.get_node_from_slot(
+                self.client.keyslot(key)
+            )
+            node_to_keys.setdefault(f"{node.host}:{node.port}", []).append(key)
 
         for chan, client, conn, cmd in self.connection.cycle._chan_to_sock:
-            expected = (self, self.client, 'BRPOP')
-            keys = node_to_keys.get(f'{conn.host}:{conn.port}')
+            expected = (self, self.client, "BRPOP")
+            keys = node_to_keys.get(f"{conn.host}:{conn.port}")
 
             if keys and (chan, client, cmd) == expected:
-                command_args = ['BRPOP', *keys, timeout]
+                command_args = ["BRPOP", *keys, timeout]
                 if self.global_keyprefix:
                     command_args = self.client._prefix_args(command_args)
                 conn.send_command(*command_args)
                 self._in_poll_connections.add(conn)
 
     def _brpop_read(self, **options):
-        conn = options.pop('conn', None)
+        conn = options.pop("conn", None)
         try:
             try:
-                dest__item = conn.read_response('BRPOP', **options)
+                dest__item = conn.read_response("BRPOP", **options)
                 if dest__item:
                     key, value = dest__item
-                    key = key[len(self.global_keyprefix):]
+                    key = key[len(self.global_keyprefix) :]
                     dest__item = key, value
             except self.connection_errors:
                 if conn is not None:
                     conn.disconnect()
                 # Remove the failed node from the startup nodes before we try
                 # to reinitialize the cluster
-                target_node = self.client.nodes_manager.startup_nodes.pop(f'{conn.host}:{conn.port}', None)
+                target_node = self.client.nodes_manager.startup_nodes.pop(
+                    f"{conn.host}:{conn.port}", None
+                )
                 # Reset the cluster node's connection
                 target_node.redis_connection = None
                 self.client.nodes_manager.initialize()
                 raise
-            except MovedError:
+            except (MovedError, valkey.exceptions.MovedError):
                 # poller need to remove conn
                 self.client.nodes_manager.initialize()
                 raise
-            except (TryAgainError, AskError):
+            except (
+                TryAgainError,
+                AskError,
+                valkey.exceptions.TryAgainError,
+                valkey.exceptions.AskError,
+            ):
                 raise Empty()
 
             if dest__item:
@@ -549,7 +582,7 @@ class Channel(RedisChannel):
         super()._receive()
 
     def _poll_error(self, conn, type, **options):
-        if type == 'LISTEN':
+        if type == "LISTEN":
             self.subclient.parse_response()
         else:
             conn.read_response(type)
@@ -559,12 +592,12 @@ class Channel(RedisChannel):
         if self._in_poll or len(self._in_poll_connections) != 0:
             try:
                 for conn in self._in_poll_connections.copy():
-                    self._brpop_read(**{'conn': conn})
+                    self._brpop_read(**{"conn": conn})
             except Empty:
                 pass
         if not self.closed:
             self.connection.cycle.discard(self)
-            client = self.__dict__.get('client')
+            client = self.__dict__.get("client")
             if client is not None:
                 for queue in self._fanout_queues:
                     if queue in self.auto_delete_queues:
@@ -574,13 +607,13 @@ class Channel(RedisChannel):
         VirtualBaseChannel.close(self)
 
     def _close_clients(self):
-        for attr in 'client', 'subclient':
+        for attr in "client", "subclient":
             try:
                 client = self.__dict__[attr]
-                if attr == 'client':
+                if attr == "client":
                     client.disconnect_connection_pools()
                     client.close()
-                if attr == 'subclient':
+                if attr == "subclient":
                     connection, client.connection = client.connection, None
                     # The Redis server will automatically detect the disconnection of the client connection
                     # and clean up all subscription states of the client.
@@ -592,11 +625,11 @@ class Channel(RedisChannel):
         conn_params = super()._connparams(asynchronous=asynchronous)
         # connection_class and db is not supported in redis.client.Redis
         # connection_pool_class is only effective when the url parameter is not empty
-        conn_params.pop('db', None)
-        conn_params.pop('connection_class', None)
-        connection_cls = redis.Connection
+        conn_params.pop("db", None)
+        conn_params.pop("connection_class", None)
+        connection_cls = valkey.Connection
         if self.connection.client.ssl:
-            connection_cls = redis.SSLConnection
+            connection_cls = valkey.SSLConnection
 
         if asynchronous:
             channel = self
@@ -607,14 +640,14 @@ class Channel(RedisChannel):
                     if channel._registered:
                         channel._on_connection_disconnect(self)
 
-            class ManagedConnectionPool(redis.ConnectionPool):
+            class ManagedConnectionPool(valkey.ConnectionPool):
                 def __init__(self, *args, **kwargs):
-                    kwargs['connection_class'] = ManagedConnection
+                    kwargs["connection_class"] = ManagedConnection
                     super().__init__(*args, **kwargs)
 
-            conn_params['connection_pool_class'] = ManagedConnectionPool
+            conn_params["connection_pool_class"] = ManagedConnectionPool
 
-        conn_params['url'] = f'redis://{conn_params["host"]}:{conn_params["port"]}'
+        conn_params["url"] = f'redis://{conn_params["host"]}:{conn_params["port"]}'
         return conn_params
 
     def _create_client(self, asynchronous=False):
@@ -626,8 +659,9 @@ class Channel(RedisChannel):
     def _get_client(self):
         if redis.VERSION < (4, 1, 0):
             raise VersionMismatch(
-                'Redis cluster transport requires redis-py versions 4.1.0 or later. '
-                'You have {0.__version__}'.format(redis))
+                "Redis cluster transport requires redis-py versions 4.1.0 or later. "
+                "You have {0.__version__}".format(redis)
+            )
 
         if self.global_keyprefix:
             return functools.partial(
@@ -635,7 +669,7 @@ class Channel(RedisChannel):
                 global_keyprefix=self.global_keyprefix,
             )
 
-        return redis.cluster.RedisCluster
+        return valkey.RedisCluster
 
     @cached_property
     def subclient(self):
@@ -647,22 +681,24 @@ class Channel(RedisChannel):
         pubsub_client.ping()
         return pubsub_client
 
-    def _do_restore_message(self, payload, exchange, routing_key,
-                            pipe, leftmost=False, key_prefix=''):
+    def _do_restore_message(
+        self, payload, exchange, routing_key, pipe, leftmost=False, key_prefix=""
+    ):
         try:
             try:
-                payload['headers']['redelivered'] = True
-                payload['properties']['delivery_info']['redelivered'] = True
+                payload["headers"]["redelivered"] = True
+                payload["properties"]["delivery_info"]["redelivered"] = True
             except KeyError:
                 pass
             for queue in self._lookup(exchange, routing_key):
                 pri = self._get_message_priority(payload, reverse=False)
 
                 (pipe.lpush if leftmost else pipe.rpush)(
-                    key_prefix + self._q_for_pri(queue, pri), dumps(payload),
+                    key_prefix + self._q_for_pri(queue, pri),
+                    dumps(payload),
                 )
         except Exception:
-            crit('Could not restore message: %r', payload, exc_info=True)
+            crit("Could not restore message: %r", payload, exc_info=True)
 
 
 class Transport(RedisTransport):
@@ -670,8 +706,8 @@ class Transport(RedisTransport):
 
     Channel = Channel
 
-    driver_type = 'rediscluster'
-    driver_name = 'rediscluster'
+    driver_type = "rediscluster"
+    driver_name = "rediscluster"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

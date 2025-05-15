@@ -335,7 +335,8 @@ class MultiChannelPoller(RedisMultiChannelPoller):
             if (channel, queue) not in self._chan_active_queues_to_conn:
                 slot = channel.client.keyslot(queue)
                 node = channel.client.nodes_manager.get_node_from_slot(
-                    slot, read_from_replicas=False
+                    slot,
+                    read_from_replicas=True,
                 )
                 if node.name not in node_to_conn:
                     conn = node.valkey_connection.connection_pool.get_connection("_")
@@ -669,9 +670,13 @@ class Channel(RedisChannel):
             return functools.partial(
                 PrefixedStrictRedis,
                 global_keyprefix=self.global_keyprefix,
+                read_from_replicas=True,
             )
 
-        return valkey.RedisCluster
+        return functools.partial(
+            valkey.RedisCluster,
+            read_from_replicas=True,
+        )
 
     @cached_property
     def subclient(self):

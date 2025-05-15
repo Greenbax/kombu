@@ -515,23 +515,28 @@ class Channel(RedisChannel):
         ]
         self._in_poll = True
 
-        node_to_keys = {}
+        node_to_slot_to_keys = {}
         for key in pri_queues:
-            node = self.client.nodes_manager.get_node_from_slot(
-                self.client.keyslot(key)
-            )
-            node_to_keys.setdefault(f"{node.host}:{node.port}", []).append(key)
+            keyslot = self.client.keyslot(key)
+            node = self.client.nodes_manager.get_node_from_slot(keyslot)
+            node_to_slot_to_keys.setdefault(f"{node.host}:{node.port}", {}).setdefault(
+                keyslot, []
+            ).append(key)
 
         for chan, client, conn, cmd in self.connection.cycle._chan_to_sock:
             expected = (self, self.client, "BRPOP")
-            keys = node_to_keys.get(f"{conn.host}:{conn.port}")
+            slot_to_keys = node_to_slot_to_keys.get(f"{conn.host}:{conn.port}")
 
-            if keys and (chan, client, cmd) == expected:
-                command_args = ["BRPOP", *keys, timeout]
-                if self.global_keyprefix:
-                    command_args = self.client._prefix_args(command_args)
-                conn.send_command(*command_args)
-                self._in_poll_connections.add(conn)
+            if not slot_to_keys:
+                continue
+
+            for _, keys in slot_to_keys.items():
+                if keys and (chan, client, cmd) == expected:
+                    command_args = ["BRPOP", *keys, timeout]
+                    if self.global_keyprefix:
+                        command_args = self.client._prefix_args(command_args)
+                    conn.send_command(*command_args)
+                    self._in_poll_connections.add(conn)
 
     def _brpop_read(self, **options):
         conn = options.pop("conn", None)

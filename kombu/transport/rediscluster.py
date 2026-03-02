@@ -709,7 +709,7 @@ class Transport(RedisTransport):
 
     Channel = Channel
 
-    driver_type = "rediscluster"
+    driver_type = "redis"
     driver_name = "rediscluster"
 
     def __init__(self, *args, **kwargs):
